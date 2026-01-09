@@ -1,0 +1,56 @@
+# Chaos Testing Configuration
+# Use this config to validate fault tolerance with self-destruct mode
+#
+# Usage (local):
+#   NPROC=2 ./scripts/launch_local.sh -- --config configs/chaos_test_config.yaml
+#
+# Usage (with etcd):
+#   ./scripts/launch_training.sh -- --config configs/chaos_test_config.yaml
+
+model:
+  vocab_size: 50257
+  d_model: 256             # Smaller model for faster testing
+  nhead: 4
+  num_layers: 2
+  dim_feedforward: 512
+  max_seq_length: 128      # Shorter sequences for speed
+  dropout: 0.1
+
+training:
+  lr: 1.0e-4
+  weight_decay: 0.01
+  batch_size: 4            # Small batch for CPU testing
+  max_steps: 500           # Short run for testing
+  log_interval: 10
+
+data:
+  enabled: false           # Use synthetic data
+
+checkpoint:
+  checkpoint_interval: 100       # Checkpoint more frequently
+  memory_snapshot_interval: 20   # Snapshot more frequently
+  nvme_path: "/tmp/chaos_checkpoints"
+  s3_bucket: null
+  async_save: false              # Sync saves for testing
+  keep_last_n: 2
+
+scaling:
+  # Use constant_batch strategy for this test
+  strategy: "constant_batch"
+  rule: "linear"
+  warmup_steps: 10
+  target_global_batch_size: 32   # 4 batch × 2 workers × 4 accum = 32
+
+elastic:
+  base_world_size: 2       # Match NPROC
+  min_nodes: 1
+  max_nodes: 4
+  heartbeat_interval: 30
+  heartbeat_timeout: 90
+
+# CHAOS MODE: Enable random crashes to test fault tolerance
+chaos:
+  enabled: true
+  crash_probability: 0.02        # 2% chance per step (will crash ~10 times in 500 steps)
+  crash_after_step: 50           # Let training stabilize first
+  crash_ranks: null              # Crash any rank except 0 (keeps training alive)

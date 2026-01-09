@@ -1,0 +1,75 @@
+[build-system]
+requires = ["setuptools>=61.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "elastic-harness"
+version = "0.1.0"
+description = "Elastic fault-tolerant distributed LLM training harness"
+readme = "README.md"
+requires-python = ">=3.10"
+license = {text = "MIT"}
+authors = [
+    {name = "Matt McManus"}
+]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
+dependencies = [
+    "torch>=2.2.0",
+    "torchdata>=0.8.0",
+    "python-etcd>=0.4.5",
+    "pyyaml>=6.0",
+    "omegaconf>=2.3.0",
+    "boto3>=1.28.0",
+    "psutil>=5.9.0",
+    "rich>=13.0.0",
+    "tensorboard>=2.15.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7.0.0",
+    "pytest-asyncio>=0.21.0",
+    "pytest-cov>=4.0.0",
+    "black>=23.0.0",
+    "ruff>=0.1.0",
+    "mypy>=1.0.0",
+]
+
+[project.scripts]
+elastic-train = "elastic_harness.train:main"
+build-index = "elastic_harness.data.index_builder:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.black]
+line-length = 100
+target-version = ["py310"]
+
+[tool.ruff]
+line-length = 100
+select = ["E", "F", "I", "N", "W", "UP"]
+
+[tool.mypy]
+python_version = "3.10"
+warn_return_any = true
+warn_unused_configs = true
+ignore_missing_imports = true
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+python_files = ["test_*.py"]
+python_functions = ["test_*"]
+addopts = "-v --tb=short"
+markers = [
+    "integration: marks tests as integration tests (deselect with '-m \"not integration\"')",
+]
