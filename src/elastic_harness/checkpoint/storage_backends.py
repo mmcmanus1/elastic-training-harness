@@ -180,6 +180,12 @@ class NVMeBackend(StorageBackend):
 
         Returns:
             The loaded CheckpointState.
+
+        Note:
+            Security: This uses weights_only=False to support arbitrary Python
+            objects in checkpoints (optimizer state, RNG state, etc.). Only load
+            checkpoints from trusted sources, as malicious checkpoints could
+            execute arbitrary code during deserialization.
         """
         from elastic_harness.checkpoint.checkpointing import CheckpointState
 
@@ -350,6 +356,12 @@ class S3Backend(StorageBackend):
 
         Returns:
             The loaded CheckpointState.
+
+        Note:
+            Security: This uses weights_only=False to support arbitrary Python
+            objects in checkpoints (optimizer state, RNG state, etc.). Only load
+            checkpoints from trusted sources, as malicious checkpoints could
+            execute arbitrary code during deserialization.
         """
         from elastic_harness.checkpoint.checkpointing import CheckpointState
 
@@ -391,18 +403,33 @@ class S3Backend(StorageBackend):
         """
         full_prefix = self._full_key(prefix)
 
-        response = self._s3.list_objects_v2(Bucket=self.bucket, Prefix=full_prefix)
-
-        if "Contents" not in response:
-            return []
-
         keys = []
-        for obj in response["Contents"]:
-            key = obj["Key"]
-            if key.endswith(".pt"):
-                # Remove the base prefix
-                relative_key = key[len(self.prefix) :]
-                keys.append(relative_key)
+        continuation_token = None
+
+        # Paginate through all results (S3 returns max 1000 per request)
+        while True:
+            if continuation_token:
+                response = self._s3.list_objects_v2(
+                    Bucket=self.bucket,
+                    Prefix=full_prefix,
+                    ContinuationToken=continuation_token,
+                )
+            else:
+                response = self._s3.list_objects_v2(Bucket=self.bucket, Prefix=full_prefix)
+
+            if "Contents" in response:
+                for obj in response["Contents"]:
+                    key = obj["Key"]
+                    if key.endswith(".pt"):
+                        # Remove the base prefix
+                        relative_key = key[len(self.prefix) :]
+                        keys.append(relative_key)
+
+            # Check if there are more results
+            if response.get("IsTruncated"):
+                continuation_token = response.get("NextContinuationToken")
+            else:
+                break
 
         return sorted(keys)
 

@@ -97,6 +97,9 @@ class SimpleTransformerLM(nn.Module):
         # Tie weights
         self.output_proj.weight = self.embedding.weight
 
+        # Loss function
+        self.loss_fct = nn.CrossEntropyLoss()
+
     def forward(
         self,
         input_ids: torch.Tensor,
@@ -116,8 +119,7 @@ class SimpleTransformerLM(nn.Module):
         output = {"logits": logits}
 
         if labels is not None:
-            loss_fct = nn.CrossEntropyLoss()
-            loss = loss_fct(logits.view(-1, logits.size(-1)), labels.view(-1))
+            loss = self.loss_fct(logits.view(-1, logits.size(-1)), labels.view(-1))
             output["loss"] = loss
 
         return output
@@ -379,7 +381,7 @@ def worker_main(args: argparse.Namespace) -> None:
                 batch = next(data_iter)
 
         # Move to device if needed
-        if not batch["input_ids"].is_cuda and torch.cuda.is_available():
+        if batch["input_ids"].device.type != "cuda" and torch.cuda.is_available():
             batch = {k: v.to(device) for k, v in batch.items()}
 
         # Forward pass
@@ -412,8 +414,12 @@ def worker_main(args: argparse.Namespace) -> None:
                 config.model.get("max_seq_length", 1024) * world_info.world_size
             ) / max(elapsed, 1e-6)
 
+            # Compute average loss over the logging interval
+            # accumulated_loss contains sum of (loss / accum_steps), so multiply back
+            avg_loss = (accumulated_loss * scaling_manager.accumulation_steps) / max(log_interval, 1)
+
             logger.info(
-                f"Step {step} | Loss: {accumulated_loss:.4f} | "
+                f"Step {step} | Loss: {avg_loss:.4f} | "
                 f"LR: {scaling_manager.current_lr:.2e} | "
                 f"Accum: {scaling_manager.accumulation_steps} | "
                 f"Tokens/s: {tokens_per_sec:.0f}"

@@ -630,10 +630,10 @@ def create_lr_scheduler_with_warmup(
     def lr_lambda(current_step: int) -> float:
         if current_step < warmup_steps:
             # Linear warmup
-            return current_step / warmup_steps
+            return current_step / max(1, warmup_steps)
         else:
             # Cosine decay
-            progress = (current_step - warmup_steps) / (total_steps - warmup_steps)
+            progress = (current_step - warmup_steps) / max(1, total_steps - warmup_steps)
             return max(min_lr, 0.5 * (1.0 + math.cos(math.pi * progress)))
 
     return optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)

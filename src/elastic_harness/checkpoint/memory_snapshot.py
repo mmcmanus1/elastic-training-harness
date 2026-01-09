@@ -221,6 +221,15 @@ class SharedMemorySnapshotBackend(MemorySnapshotBackend):
 
     Note: This is a more advanced feature and requires careful handling
     of shared memory resources.
+
+    TODO: This is currently a placeholder that falls back to regular in-process
+    memory snapshots. A full implementation would use torch.multiprocessing
+    shared memory or POSIX shared memory to persist snapshots across process
+    restarts. Key implementation considerations:
+    - Use shared memory segments with proper cleanup on shutdown
+    - Handle serialization of PyTorch tensors to shared memory
+    - Implement proper locking for concurrent access
+    - Add memory mapping for large checkpoints
     """
 
     def __init__(
