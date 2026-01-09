@@ -1,5 +1,7 @@
 # Elastic Training Harness
 
+[![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/mmcmanus1/elastic-training-harness/blob/main/notebooks/elastic_training_colab.ipynb)
+
 A fault-tolerant distributed training harness for LLM training that automatically handles node failures, re-balances workloads, and resumes training with minimal recovery time.
 
 ## Features
