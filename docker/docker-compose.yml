@@ -1,0 +1,39 @@
+version: '3.8'
+
+services:
+  etcd:
+    image: quay.io/coreos/etcd:v3.4.33
+    container_name: elastic-training-etcd
+    command:
+      - etcd
+      - --name=etcd0
+      - --data-dir=/etcd-data
+      - --listen-client-urls=http://0.0.0.0:2379
+      - --advertise-client-urls=http://localhost:2379
+      - --listen-peer-urls=http://0.0.0.0:2380
+      - --initial-advertise-peer-urls=http://etcd:2380
+      - --initial-cluster=etcd0=http://etcd:2380
+      - --initial-cluster-token=elastic-training-cluster
+      - --initial-cluster-state=new
+      - --enable-v2  # CRITICAL: Required for PyTorch elastic rendezvous
+    ports:
+      - "2379:2379"
+      - "2380:2380"
+    volumes:
+      - etcd-data:/etcd-data
+    healthcheck:
+      test: ["CMD", "etcdctl", "endpoint", "health"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+    restart: unless-stopped
+    networks:
+      - elastic-training
+
+networks:
+  elastic-training:
+    driver: bridge
+
+volumes:
+  etcd-data:
+    driver: local

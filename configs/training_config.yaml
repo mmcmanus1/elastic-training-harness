@@ -1,0 +1,62 @@
+# Elastic Training Configuration
+# This file configures the elastic fault-tolerant training harness.
+
+model:
+  vocab_size: 50257        # GPT-2 vocabulary size
+  d_model: 512             # Model dimension
+  nhead: 8                 # Number of attention heads
+  num_layers: 6            # Number of transformer layers
+  dim_feedforward: 2048    # FFN dimension
+  max_seq_length: 1024     # Maximum sequence length
+  dropout: 0.1             # Dropout rate
+
+training:
+  lr: 1.0e-4               # Base learning rate
+  weight_decay: 0.01       # AdamW weight decay
+  batch_size: 8            # Batch size per worker
+  max_steps: 100000        # Total training steps
+  log_interval: 10         # Steps between log messages
+
+data:
+  enabled: false           # Set to true with actual data
+  files: []                # List of data file paths (JSONL)
+  index_path: ""           # Token index file path
+  tokenizer: "gpt2"        # Tokenizer name/path
+  num_workers: 4           # DataLoader workers
+  text_key: "text"         # JSON key for text field
+
+checkpoint:
+  checkpoint_interval: 500       # Steps between NVMe checkpoints
+  memory_snapshot_interval: 50   # Steps between in-memory snapshots
+  nvme_path: "/tmp/checkpoints"  # Local checkpoint directory
+  s3_bucket: null                # S3 bucket (optional)
+  s3_prefix: ""                  # S3 key prefix
+  async_save: true               # Async S3 uploads
+  keep_last_n: 3                 # Number of checkpoints to keep
+
+scaling:
+  # Strategy for handling topology changes:
+  #   "variable_batch" - Keep accumulation constant, scale LR (default)
+  #   "constant_batch" - Adjust accumulation to maintain global batch size
+  strategy: "variable_batch"
+
+  rule: "linear"                 # LR scaling rule: linear, sqrt, none
+  warmup_steps: 100              # Steps to warmup after topology change
+
+  # For constant_batch strategy: target global batch size
+  # accumulation_steps = target / (local_batch * world_size)
+  target_global_batch_size: null  # Set to enable constant batch mode
+
+elastic:
+  base_world_size: 4       # Base world size for LR/accumulation calculation
+  min_nodes: 1             # Minimum nodes to start
+  max_nodes: 8             # Maximum nodes allowed
+  heartbeat_interval: 30   # Heartbeat interval (seconds)
+  heartbeat_timeout: 90    # Heartbeat timeout (seconds)
+
+# Chaos testing configuration (for fault tolerance validation)
+chaos:
+  enabled: false           # Enable random process crashes
+  crash_probability: 0.001 # Probability of crash per step
+  crash_after_step: 50     # Only crash after this step
+  crash_ranks: null        # List of ranks that can crash (null = all except 0)

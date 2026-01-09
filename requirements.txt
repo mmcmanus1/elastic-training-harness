@@ -1,0 +1,25 @@
+# Core PyTorch
+torch>=2.2.0
+torchdata>=0.8.0
+
+# Distributed training - etcd client
+python-etcd>=0.4.5
+
+# Configuration
+pyyaml>=6.0
+omegaconf>=2.3.0
+
+# AWS S3 storage
+boto3>=1.28.0
+
+# Process management for chaos testing
+psutil>=5.9.0
+
+# Logging and monitoring
+rich>=13.0.0
+tensorboard>=2.15.0
+
+# Testing
+pytest>=7.0.0
+pytest-asyncio>=0.21.0
+pytest-cov>=4.0.0
