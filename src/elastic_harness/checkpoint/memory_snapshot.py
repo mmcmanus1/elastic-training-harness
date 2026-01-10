@@ -7,6 +7,7 @@ recent snapshots in RAM for near-instant recovery from non-fatal errors.
 from __future__ import annotations
 
 import copy
+import logging
 import threading
 import time
 from collections import deque
@@ -17,6 +18,17 @@ import torch
 
 if TYPE_CHECKING:
     from elastic_harness.checkpoint.checkpointing import CheckpointState
+
+logger = logging.getLogger(__name__)
+
+
+class MemoryLimitExceeded(Exception):
+    """Raised when memory snapshot would exceed configured limit."""
+
+    def __init__(self, message: str, requested_bytes: int, available_bytes: int):
+        self.requested_bytes = requested_bytes
+        self.available_bytes = available_bytes
+        super().__init__(message)
 
 
 @dataclass
@@ -46,21 +58,33 @@ class MemorySnapshotBackend:
     - Thread-safe for concurrent access
     - Automatic CPU tensor conversion
     - Memory usage tracking
+    - Configurable memory limits
 
     Example:
-        >>> backend = MemorySnapshotBackend(max_snapshots=2)
+        >>> backend = MemorySnapshotBackend(max_snapshots=2, max_memory_mb=1024)
         >>> backend.save(state)
         >>> # Later, on recovery...
         >>> restored = backend.load()
     """
 
-    def __init__(self, max_snapshots: int = 2):
+    def __init__(
+        self,
+        max_snapshots: int = 2,
+        max_memory_mb: float | None = None,
+        memory_warning_threshold: float = 0.8,
+    ):
         """Initialize memory snapshot backend.
 
         Args:
             max_snapshots: Maximum number of snapshots to keep in memory.
+            max_memory_mb: Maximum memory to use for snapshots in MB.
+                If None, no limit is enforced (only max_snapshots).
+            memory_warning_threshold: Warn when usage exceeds this fraction
+                of max_memory_mb (default 0.8 = 80%).
         """
         self.max_snapshots = max_snapshots
+        self.max_memory_bytes = int(max_memory_mb * 1024 * 1024) if max_memory_mb else None
+        self.memory_warning_threshold = memory_warning_threshold
         self._snapshots: deque[MemorySnapshot] = deque(maxlen=max_snapshots)
         self._lock = threading.RLock()
 
@@ -68,14 +92,58 @@ class MemorySnapshotBackend:
         """Save checkpoint snapshot to memory.
 
         Creates a deep copy of all tensors on CPU and stores in the
-        circular buffer.
+        circular buffer. Enforces memory limits if configured.
 
         Args:
             state: The checkpoint state to snapshot.
+
+        Raises:
+            MemoryLimitExceeded: If the snapshot would exceed the configured
+                memory limit and cannot be accommodated.
         """
         with self._lock:
             # Create CPU copy of state
             cpu_state = state.cpu_copy()
+
+            # Estimate size of new snapshot
+            estimated_size = self._estimate_state_size(cpu_state)
+            current_usage = self.memory_usage_bytes()
+
+            # Check and enforce memory limit if configured
+            if self.max_memory_bytes is not None:
+                # Try to make room by removing oldest snapshots if needed
+                while (
+                    self._snapshots
+                    and current_usage + estimated_size > self.max_memory_bytes
+                ):
+                    removed = self._snapshots.popleft()
+                    removed_size = self._estimate_state_size(removed.state)
+                    current_usage -= removed_size
+                    logger.info(
+                        f"Removed snapshot at step {removed.step} to stay within "
+                        f"memory limit ({removed_size / 1024 / 1024:.1f}MB freed)"
+                    )
+
+                # If still too big after removing all snapshots, raise error
+                if current_usage + estimated_size > self.max_memory_bytes:
+                    available = self.max_memory_bytes - current_usage
+                    raise MemoryLimitExceeded(
+                        f"Cannot save snapshot: {estimated_size / 1024 / 1024:.1f}MB required, "
+                        f"but only {available / 1024 / 1024:.1f}MB available "
+                        f"(limit: {self.max_memory_bytes / 1024 / 1024:.1f}MB)",
+                        requested_bytes=estimated_size,
+                        available_bytes=available,
+                    )
+
+                # Warn if approaching limit
+                new_usage = current_usage + estimated_size
+                if new_usage > self.max_memory_bytes * self.memory_warning_threshold:
+                    usage_pct = new_usage / self.max_memory_bytes * 100
+                    logger.warning(
+                        f"Memory snapshot usage at {usage_pct:.1f}% of limit "
+                        f"({new_usage / 1024 / 1024:.1f}MB / "
+                        f"{self.max_memory_bytes / 1024 / 1024:.1f}MB)"
+                    )
 
             snapshot = MemorySnapshot(
                 state=cpu_state,

@@ -21,6 +21,7 @@ import torch.distributed as dist
 
 from elastic_harness.checkpoint.memory_snapshot import MemorySnapshotBackend
 from elastic_harness.checkpoint.storage_backends import NVMeBackend, S3Backend, StorageBackend
+from elastic_harness.errors import CheckpointSaveError
 
 logger = logging.getLogger(__name__)
 
@@ -31,6 +32,14 @@ class CheckpointTier(Enum):
     MEMORY = "memory"  # In-memory snapshot (fastest)
     NVME = "nvme"  # Local NVMe/SSD (fast)
     S3 = "s3"  # S3/cloud storage (durable)
+
+
+class AsyncSavePolicy:
+    """Policies for handling async save failures."""
+
+    WARN = "warn"  # Log warning and continue (default, backwards compatible)
+    FAIL = "fail"  # Raise exception on failure
+    RETRY = "retry"  # Retry failed saves with exponential backoff
 
 
 @dataclass
@@ -45,6 +54,9 @@ class CheckpointConfig:
         s3_prefix: S3 key prefix.
         async_save: Whether to use async saves for S3.
         keep_last_n: Number of recent checkpoints to keep.
+        async_save_policy: How to handle async save failures ('warn', 'fail', 'retry').
+        async_save_retries: Number of retry attempts for 'retry' policy.
+        async_save_retry_delay: Base delay between retries in seconds.
     """
 
     checkpoint_interval: int = 500
@@ -54,6 +66,9 @@ class CheckpointConfig:
     s3_prefix: str = ""
     async_save: bool = True
     keep_last_n: int = 3
+    async_save_policy: str = AsyncSavePolicy.WARN
+    async_save_retries: int = 3
+    async_save_retry_delay: float = 5.0
 
 
 @dataclass
@@ -187,8 +202,8 @@ class CheckpointManager:
         if config.s3_bucket:
             self.s3_backend = S3Backend(config.s3_bucket, config.s3_prefix)
 
-        # Track pending async saves
-        self._pending_saves: list[Future] = []
+        # Track pending async saves with metadata for retry
+        self._pending_saves: list[dict] = []  # [{future, path, state, retry_count}]
 
     def save_checkpoint(
         self,
@@ -228,8 +243,14 @@ class CheckpointManager:
             path = f"checkpoint_step_{state.step:08d}.pt"
 
             if self.config.async_save:
+                cpu_state = state.cpu_copy()  # Keep a copy for potential retry
                 future = self.s3_backend.save_async(state, path)
-                self._pending_saves.append(future)
+                self._pending_saves.append({
+                    "future": future,
+                    "path": path,
+                    "state": cpu_state,
+                    "retry_count": 0,
+                })
                 logger.info(f"S3 checkpoint upload started (async): {path}")
             else:
                 self.s3_backend.save(state, path)
@@ -322,33 +343,105 @@ class CheckpointManager:
     def wait_for_pending_saves(self, timeout: float | None = None) -> bool:
         """Wait for all pending async saves to complete.
 
+        Handles failures according to the configured async_save_policy:
+        - 'warn': Log warning and continue (default)
+        - 'fail': Raise CheckpointSaveError on failure
+        - 'retry': Retry failed saves with exponential backoff
+
         Args:
             timeout: Maximum time to wait (None for infinite).
 
         Returns:
-            True if all saves completed, False if timeout.
+            True if all saves completed successfully, False if timeout or failures.
+
+        Raises:
+            CheckpointSaveError: If policy is 'fail' and any save fails.
         """
-        from concurrent.futures import wait, FIRST_EXCEPTION
+        from concurrent.futures import wait, ALL_COMPLETED
 
         if not self._pending_saves:
             return True
 
-        done, not_done = wait(
-            self._pending_saves,
-            timeout=timeout,
-            return_when=FIRST_EXCEPTION,
-        )
+        all_success = True
 
-        # Check for exceptions
-        for future in done:
-            exc = future.exception()
-            if exc:
-                logger.error(f"Async save failed: {exc}")
+        # Use iterative approach instead of recursion to avoid stack overflow
+        while self._pending_saves:
+            # Extract futures from pending save metadata
+            futures = [save_info["future"] for save_info in self._pending_saves]
 
-        # Clear completed futures
-        self._pending_saves = list(not_done)
+            done, not_done = wait(futures, timeout=timeout, return_when=ALL_COMPLETED)
 
-        return len(not_done) == 0
+            # Process completed saves
+            failed_saves = []
+
+            for save_info in self._pending_saves:
+                future = save_info["future"]
+                if future in done:
+                    exc = future.exception()
+                    if exc:
+                        failed_saves.append((save_info, exc))
+                    # Successfully completed saves don't need tracking
+
+            # Handle failures based on policy
+            new_pending = []
+
+            for save_info, exc in failed_saves:
+                path = save_info["path"]
+                retry_count = save_info["retry_count"]
+                policy = self.config.async_save_policy
+
+                if policy == AsyncSavePolicy.FAIL:
+                    raise CheckpointSaveError(
+                        f"Async checkpoint save failed for '{path}': {exc}",
+                        path=path,
+                        original_error=exc,
+                    )
+
+                elif policy == AsyncSavePolicy.RETRY:
+                    if retry_count < self.config.async_save_retries:
+                        # Retry with exponential backoff
+                        delay = self.config.async_save_retry_delay * (2 ** retry_count)
+                        logger.warning(
+                            f"Async save failed for '{path}' (attempt {retry_count + 1}), "
+                            f"retrying in {delay:.1f}s: {exc}"
+                        )
+                        time.sleep(delay)
+
+                        # Resubmit the save
+                        state = save_info["state"]
+                        new_future = self.s3_backend.save_async(state, path)
+                        new_pending.append({
+                            "future": new_future,
+                            "path": path,
+                            "state": state,
+                            "retry_count": retry_count + 1,
+                        })
+                    else:
+                        logger.error(
+                            f"Async save failed for '{path}' after {retry_count + 1} attempts. "
+                            f"Checkpoint may be incomplete: {exc}"
+                        )
+                        all_success = False
+
+                else:  # WARN (default)
+                    logger.warning(
+                        f"Async save failed for '{path}': {exc}. "
+                        "Training continues but checkpoint may be incomplete."
+                    )
+                    all_success = False
+
+            # Keep track of saves still in progress
+            for save_info in self._pending_saves:
+                if save_info["future"] in not_done:
+                    new_pending.append(save_info)
+
+            self._pending_saves = new_pending
+
+            # If no retries pending or not using retry policy, exit the loop
+            if not new_pending or self.config.async_save_policy != AsyncSavePolicy.RETRY:
+                break
+
+        return all_success and len(self._pending_saves) == 0
 
     def clear_memory_snapshots(self) -> None:
         """Clear in-memory snapshots to free RAM.

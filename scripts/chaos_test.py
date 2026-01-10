@@ -8,6 +8,11 @@ Usage:
     python chaos_test.py --interval 300 --duration 3600
 
 This will kill a random training worker every 5 minutes for 1 hour.
+
+Enhanced features:
+- Configurable kill signals (SIGKILL, SIGTERM, SIGINT)
+- Training progress verification (step count, loss values)
+- Better process detection and tracking
 """
 
 from __future__ import annotations
@@ -23,6 +28,7 @@ import sys
 import time
 from dataclasses import dataclass, field
 from datetime import datetime
+from enum import Enum
 from pathlib import Path
 from typing import Any
 
@@ -34,6 +40,31 @@ logging.basicConfig(
     datefmt="%Y-%m-%d %H:%M:%S",
 )
 logger = logging.getLogger(__name__)
+
+
+class KillSignal(Enum):
+    """Signals that can be used to kill workers."""
+
+    SIGKILL = signal.SIGKILL  # Immediate death (cannot be caught)
+    SIGTERM = signal.SIGTERM  # Graceful shutdown request
+    SIGINT = signal.SIGINT    # Ctrl+C simulation
+
+
+@dataclass
+class ChaosConfig:
+    """Configuration for chaos testing.
+
+    Attributes:
+        kill_signal: Signal to use for killing workers.
+        verify_progress: Whether to verify training progress after recovery.
+        min_step_progress: Minimum steps that should be made after recovery.
+        checkpoint_dir: Directory where checkpoints are saved (for progress verification).
+    """
+
+    kill_signal: KillSignal = KillSignal.SIGKILL
+    verify_progress: bool = True
+    min_step_progress: int = 5
+    checkpoint_dir: str | None = None
 
 
 @dataclass
@@ -91,6 +122,11 @@ class ChaosTestRunner:
 
     This class manages chaos testing by periodically killing random training
     workers and measuring the recovery time.
+
+    Enhanced features:
+    - Configurable kill signals for different failure scenarios
+    - Training progress verification after recovery
+    - Better process detection via PID tracking
     """
 
     def __init__(
@@ -98,6 +134,7 @@ class ChaosTestRunner:
         process_pattern: str = "train.py",
         min_survivors: int = 1,
         rto_threshold: float = 30.0,
+        config: ChaosConfig | None = None,
     ):
         """Initialize chaos test runner.
 
@@ -105,11 +142,15 @@ class ChaosTestRunner:
             process_pattern: Pattern to identify training processes.
             min_survivors: Minimum number of workers that must survive.
             rto_threshold: Target RTO in seconds (for reporting).
+            config: Chaos configuration for advanced settings.
         """
         self.process_pattern = process_pattern
         self.min_survivors = min_survivors
         self.rto_threshold = rto_threshold
+        self.config = config or ChaosConfig()
         self.result = ChaosTestResult(start_time=time.time(), end_time=0)
+        self._last_known_step: int | None = None
+        self._tracked_pids: set[int] = set()
 
     def find_training_processes(self) -> list[psutil.Process]:
         """Find all training worker processes.
@@ -183,8 +224,12 @@ class ChaosTestRunner:
         target_proc, target_rank = random.choice(candidates)
 
         try:
-            logger.info(f"Killing worker PID {target_proc.pid} (rank {target_rank})")
-            target_proc.send_signal(signal.SIGKILL)
+            kill_signal = self.config.kill_signal
+            logger.info(
+                f"Killing worker PID {target_proc.pid} (rank {target_rank}) "
+                f"with {kill_signal.name}"
+            )
+            target_proc.send_signal(kill_signal.value)
 
             event = ChaosEvent(
                 timestamp=time.time(),
@@ -201,6 +246,67 @@ class ChaosTestRunner:
             logger.warning(f"Process {target_proc.pid} already dead")
             return None
 
+    def get_current_step(self) -> int | None:
+        """Get the current training step from checkpoint files.
+
+        Returns:
+            Current training step, or None if cannot be determined.
+        """
+        checkpoint_dir = self.config.checkpoint_dir
+        if not checkpoint_dir:
+            return None
+
+        checkpoint_path = Path(checkpoint_dir)
+        if not checkpoint_path.exists():
+            return None
+
+        # Find latest checkpoint file (format: checkpoint_step_XXXXXXXX.pt)
+        checkpoints = sorted(checkpoint_path.glob("checkpoint_step_*.pt"))
+        if not checkpoints:
+            return None
+
+        latest = checkpoints[-1]
+        # Extract step from filename
+        match = re.search(r"checkpoint_step_(\d+)\.pt", latest.name)
+        if match:
+            return int(match.group(1))
+
+        return None
+
+    def verify_training_progress(self, timeout: float = 60.0) -> bool:
+        """Verify that training is making progress.
+
+        This checks that the training step is increasing, indicating
+        that training has actually resumed and is making progress.
+
+        Args:
+            timeout: Maximum time to wait for progress verification.
+
+        Returns:
+            True if training is making progress.
+        """
+        if not self.config.verify_progress:
+            return True
+
+        current_step = self.get_current_step()
+        if current_step is None:
+            logger.warning("Cannot verify progress: checkpoint directory not set or no checkpoints found")
+            return True  # Assume success if we can't verify
+
+        if self._last_known_step is not None:
+            progress = current_step - self._last_known_step
+            if progress < self.config.min_step_progress:
+                logger.warning(
+                    f"Insufficient training progress: {progress} steps "
+                    f"(expected >= {self.config.min_step_progress})"
+                )
+                return False
+
+            logger.info(f"Training progress verified: {progress} steps since last check")
+
+        self._last_known_step = current_step
+        return True
+
     def verify_recovery(
         self,
         event: ChaosEvent,
@@ -208,6 +314,10 @@ class ChaosTestRunner:
         poll_interval: float = 1.0,
     ) -> bool:
         """Verify that training recovers after a kill.
+
+        This method checks:
+        1. That the expected number of workers are running
+        2. That training is making progress (if configured)
 
         Args:
             event: The chaos event to verify recovery for.
@@ -235,8 +345,18 @@ class ChaosTestRunner:
                 if alive_count >= self.min_survivors:
                     recovery_time = time.time() - event.timestamp
                     event.recovery_time = recovery_time
-                    event.success = True
 
+                    # Optionally verify training progress
+                    if self.config.verify_progress:
+                        # Wait a bit for training to make progress
+                        time.sleep(5)
+                        if not self.verify_training_progress():
+                            logger.warning("Recovery detected but training not making progress")
+                            event.success = False
+                            self.result.failed_recoveries += 1
+                            return False
+
+                    event.success = True
                     logger.info(
                         f"Recovery verified in {recovery_time:.2f}s "
                         f"({'PASS' if recovery_time <= self.rto_threshold else 'SLOW'})"
@@ -386,13 +506,51 @@ def main():
         action="store_true",
         help="Kill one worker and exit (for testing)",
     )
+    parser.add_argument(
+        "--kill-signal",
+        type=str,
+        choices=["SIGKILL", "SIGTERM", "SIGINT"],
+        default="SIGKILL",
+        help="Signal to use for killing workers (default: SIGKILL)",
+    )
+    parser.add_argument(
+        "--verify-progress",
+        action="store_true",
+        default=False,
+        help="Verify training makes progress after recovery",
+    )
+    parser.add_argument(
+        "--checkpoint-dir",
+        type=str,
+        help="Checkpoint directory for progress verification",
+    )
+    parser.add_argument(
+        "--min-step-progress",
+        type=int,
+        default=5,
+        help="Minimum steps expected between checks (default: 5)",
+    )
 
     args = parser.parse_args()
+
+    # Build chaos config
+    kill_signal_map = {
+        "SIGKILL": KillSignal.SIGKILL,
+        "SIGTERM": KillSignal.SIGTERM,
+        "SIGINT": KillSignal.SIGINT,
+    }
+    chaos_config = ChaosConfig(
+        kill_signal=kill_signal_map[args.kill_signal],
+        verify_progress=args.verify_progress,
+        min_step_progress=args.min_step_progress,
+        checkpoint_dir=args.checkpoint_dir,
+    )
 
     runner = ChaosTestRunner(
         process_pattern=args.process_pattern,
         min_survivors=args.min_survivors,
         rto_threshold=args.rto_threshold,
+        config=chaos_config,
     )
 
     if args.single_kill:

@@ -312,6 +312,14 @@ class WarmupScheduler:
         return self.start_lr + progress * (self.target_lr - self.start_lr)
 
 
+class RoundingMode:
+    """Rounding modes for gradient accumulation step calculation."""
+
+    CEIL = "ceil"  # Round up (never drop below target batch size)
+    FLOOR = "floor"  # Round down (never exceed target batch size)
+    NEAREST = "nearest"  # Round to nearest (Python's round())
+
+
 @dataclass
 class GradAccumulationConfig:
     """Configuration for dynamic gradient accumulation.
@@ -320,11 +328,16 @@ class GradAccumulationConfig:
         target_global_batch_size: Target global batch size to maintain.
         local_batch_size: Batch size per GPU.
         base_world_size: World size at base configuration.
+        rounding_mode: How to round accumulation steps ('ceil', 'floor', 'nearest').
+            - 'ceil': Round up, ensures effective batch >= target (default, conservative)
+            - 'floor': Round down, ensures effective batch <= target
+            - 'nearest': Round to nearest, may over or undershoot target
     """
 
     target_global_batch_size: int
     local_batch_size: int
     base_world_size: int
+    rounding_mode: str = RoundingMode.CEIL
 
     @property
     def base_accumulation_steps(self) -> int:
@@ -405,13 +418,29 @@ class GradientAccumulationManager:
         old_world_size = self._current_world_size
         old_accum = self._accumulation_steps
 
-        # Calculate new accumulation steps
+        # Calculate new accumulation steps with configurable rounding
         per_step_batch = self.config.local_batch_size * new_world_size
-        new_accum = max(1, round(self.config.target_global_batch_size / per_step_batch))
+        raw_accum = self.config.target_global_batch_size / per_step_batch
+
+        rounding_mode = self.config.rounding_mode
+        if rounding_mode == RoundingMode.CEIL:
+            new_accum = max(1, math.ceil(raw_accum))
+        elif rounding_mode == RoundingMode.FLOOR:
+            new_accum = max(1, math.floor(raw_accum))
+        else:  # NEAREST (default fallback)
+            new_accum = max(1, round(raw_accum))
 
         # Calculate actual effective batch sizes
         old_effective = self.config.local_batch_size * old_world_size * old_accum
         new_effective = self.config.local_batch_size * new_world_size * new_accum
+
+        # Log warning if effective batch differs from target
+        if new_effective != self.config.target_global_batch_size:
+            logger.warning(
+                f"Effective batch size ({new_effective}) differs from target "
+                f"({self.config.target_global_batch_size}) due to rounding "
+                f"(mode: {rounding_mode})"
+            )
 
         logger.info(
             f"Gradient accumulation adjusted: "
