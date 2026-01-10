@@ -650,11 +650,14 @@ def create_lr_scheduler_with_warmup(
         optimizer: The optimizer.
         warmup_steps: Number of warmup steps.
         total_steps: Total training steps.
-        min_lr: Minimum learning rate at end of cosine decay.
+        min_lr: Minimum learning rate at end of cosine decay (absolute value).
 
     Returns:
         LR scheduler with warmup and cosine decay.
     """
+    # Get base LR to calculate min multiplier (LambdaLR applies a multiplier to base_lr)
+    base_lr = optimizer.param_groups[0]["lr"]
+    min_multiplier = min_lr / base_lr if base_lr > 0 else 0.0
 
     def lr_lambda(current_step: int) -> float:
         if current_step < warmup_steps:
@@ -663,6 +666,6 @@ def create_lr_scheduler_with_warmup(
         else:
             # Cosine decay
             progress = (current_step - warmup_steps) / max(1, total_steps - warmup_steps)
-            return max(min_lr, 0.5 * (1.0 + math.cos(math.pi * progress)))
+            return max(min_multiplier, 0.5 * (1.0 + math.cos(math.pi * progress)))
 
     return optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)

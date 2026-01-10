@@ -283,16 +283,26 @@ class TestLRScalingManager:
         assert manager.current_lr == 5e-5
         assert manager._current_world_size == 2
 
-    def test_applies_lr_to_optimizer(self, scaling_config, simple_optimizer):
+    def test_applies_lr_to_optimizer(self, simple_optimizer):
         """Test that LR changes are applied to optimizer."""
-        manager = LRScalingManager(scaling_config, simple_optimizer)
+        # Use config without warmup so LR is applied immediately
+        config = ScalingConfig(
+            base_lr=1e-4,
+            base_batch_size=8,
+            base_world_size=4,
+            scaling_rule=ScalingRule.LINEAR,
+            warmup_steps=0,  # No warmup - LR change should be immediate
+            min_lr=1e-7,
+            max_lr=1e-2,
+        )
+        manager = LRScalingManager(config, simple_optimizer)
 
         manager.on_topology_change(new_world_size=2)
 
-        # Check optimizer param groups
+        # Check optimizer param groups - LR should have changed from base
+        # With world_size halved (4->2), effective batch halved, so LR halved: 1e-4 / 2 = 5e-5
         for param_group in simple_optimizer.param_groups:
-            # LR should have changed from base
-            assert param_group["lr"] != scaling_config.base_lr
+            assert param_group["lr"] == 5e-5
 
 
 class TestCreateLRSchedulerWithWarmup:
