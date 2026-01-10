@@ -7,13 +7,14 @@ checkpoints to various backends: local NVMe, S3, etc.
 from __future__ import annotations
 
 import io
+import logging
 import os
 import shutil
 import tempfile
 import threading
 from abc import ABC, abstractmethod
 from concurrent.futures import Future, ThreadPoolExecutor
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
@@ -21,6 +22,108 @@ import torch
 
 if TYPE_CHECKING:
     from elastic_harness.checkpoint.checkpointing import CheckpointState
+
+logger = logging.getLogger(__name__)
+
+
+@dataclass
+class CheckpointLoadConfig:
+    """Configuration for checkpoint loading behavior.
+
+    Attributes:
+        safe_mode: If True, validate checkpoint structure before loading.
+            This provides defense against malformed checkpoints but does NOT
+            fully protect against malicious code execution. For untrusted
+            checkpoints, consider additional validation.
+        validate_structure: If True, validate required keys exist.
+        warn_on_unsafe: Log a warning when loading without safe_mode.
+    """
+
+    safe_mode: bool = True
+    validate_structure: bool = True
+    warn_on_unsafe: bool = True
+
+
+def _validate_checkpoint_structure(state_dict: dict[str, Any]) -> tuple[bool, str]:
+    """Validate that a checkpoint has the expected structure.
+
+    This provides basic validation of checkpoint structure but does NOT
+    protect against malicious code execution from pickle deserialization.
+
+    Args:
+        state_dict: The loaded checkpoint dictionary.
+
+    Returns:
+        Tuple of (is_valid, error_message).
+    """
+    # Required top-level keys
+    required_keys = {"step", "model_state_dict", "optimizer_state_dict"}
+    missing_keys = required_keys - set(state_dict.keys())
+    if missing_keys:
+        return False, f"Missing required keys: {missing_keys}"
+
+    # Validate step is an integer
+    if not isinstance(state_dict.get("step"), int):
+        return False, f"'step' must be an integer, got {type(state_dict.get('step'))}"
+
+    # Validate model_state_dict contains only tensors
+    model_state = state_dict.get("model_state_dict", {})
+    if not isinstance(model_state, dict):
+        return False, f"'model_state_dict' must be a dict, got {type(model_state)}"
+
+    for key, value in model_state.items():
+        if not isinstance(value, torch.Tensor):
+            return False, f"model_state_dict['{key}'] must be a Tensor, got {type(value)}"
+
+    # Validate optimizer_state_dict has expected structure
+    optim_state = state_dict.get("optimizer_state_dict", {})
+    if not isinstance(optim_state, dict):
+        return False, f"'optimizer_state_dict' must be a dict, got {type(optim_state)}"
+
+    return True, ""
+
+
+def _load_checkpoint_safe(path_or_buffer: str | Path | io.BytesIO) -> dict[str, Any]:
+    """Load checkpoint with safety measures.
+
+    Attempts to load with weights_only=True first, then falls back to
+    weights_only=False if needed (e.g., for optimizer state).
+
+    Args:
+        path_or_buffer: File path or BytesIO buffer containing checkpoint.
+
+    Returns:
+        Loaded checkpoint dictionary.
+
+    Note:
+        This function attempts safe loading but may fall back to unsafe
+        loading for full optimizer state support. The fallback logs a warning.
+    """
+    try:
+        # Try safe loading first (weights_only=True)
+        state_dict = torch.load(path_or_buffer, map_location="cpu", weights_only=True)
+        return state_dict
+    except Exception as e:
+        # weights_only=True may fail for optimizer states with complex objects
+        # Log at WARNING level so users are aware of the fallback
+        logger.warning(
+            f"Safe checkpoint loading failed (weights_only=True): {e}. "
+            "Falling back to full deserialization."
+        )
+
+        # Reset buffer position if BytesIO
+        if isinstance(path_or_buffer, io.BytesIO):
+            path_or_buffer.seek(0)
+
+        # Fall back to full load - log prominent warning about security implications
+        logger.warning(
+            "SECURITY: Loading checkpoint with weights_only=False enables arbitrary "
+            "code execution during deserialization. Only load checkpoints from "
+            "trusted sources. Consider using CheckpointLoadConfig(safe_mode=False) "
+            "explicitly if this is intentional."
+        )
+        state_dict = torch.load(path_or_buffer, map_location="cpu", weights_only=False)
+        return state_dict
 
 
 class StorageBackend(ABC):
@@ -172,25 +275,49 @@ class NVMeBackend(StorageBackend):
         cpu_state = state.cpu_copy()
         return self._executor.submit(self.save, cpu_state, path)
 
-    def load(self, path: str) -> CheckpointState:
+    def load(
+        self,
+        path: str,
+        config: CheckpointLoadConfig | None = None,
+    ) -> CheckpointState:
         """Load checkpoint from local disk.
 
         Args:
             path: Relative path within base_path.
+            config: Loading configuration. If None, uses safe defaults.
 
         Returns:
             The loaded CheckpointState.
 
+        Raises:
+            ValueError: If checkpoint validation fails.
+
         Note:
-            Security: This uses weights_only=False to support arbitrary Python
-            objects in checkpoints (optimizer state, RNG state, etc.). Only load
-            checkpoints from trusted sources, as malicious checkpoints could
-            execute arbitrary code during deserialization.
+            By default, this attempts safe loading (weights_only=True) first,
+            falling back to full loading if needed for optimizer state.
+            Set config.safe_mode=False to skip safe loading attempt.
         """
         from elastic_harness.checkpoint.checkpointing import CheckpointState
 
+        config = config or CheckpointLoadConfig()
         full_path = self._full_path(path)
-        state_dict = torch.load(full_path, map_location="cpu", weights_only=False)
+
+        if config.safe_mode:
+            state_dict = _load_checkpoint_safe(full_path)
+        else:
+            if config.warn_on_unsafe:
+                logger.warning(
+                    f"Loading checkpoint '{path}' with safe_mode=False. "
+                    "Only load checkpoints from trusted sources."
+                )
+            state_dict = torch.load(full_path, map_location="cpu", weights_only=False)
+
+        # Validate checkpoint structure
+        if config.validate_structure:
+            is_valid, error_msg = _validate_checkpoint_structure(state_dict)
+            if not is_valid:
+                raise ValueError(f"Invalid checkpoint structure: {error_msg}")
+
         return CheckpointState.from_dict(state_dict)
 
     def exists(self, path: str) -> bool:
@@ -273,6 +400,29 @@ class NVMeBackend(StorageBackend):
         return to_delete
 
 
+@dataclass
+class S3Config:
+    """S3 backend configuration.
+
+    Attributes:
+        bucket: S3 bucket name.
+        prefix: Key prefix for all checkpoints.
+        region: AWS region (uses default if not specified).
+        connect_timeout: Connection timeout in seconds.
+        read_timeout: Read timeout in seconds.
+        max_retries: Maximum number of retry attempts.
+        retry_mode: Boto3 retry mode ('standard', 'adaptive', or 'legacy').
+    """
+
+    bucket: str
+    prefix: str = ""
+    region: str | None = None
+    connect_timeout: float = 10.0
+    read_timeout: float = 60.0
+    max_retries: int = 3
+    retry_mode: str = "adaptive"
+
+
 class S3Backend(StorageBackend):
     """S3 storage backend for durable checkpoint storage.
 
@@ -283,6 +433,10 @@ class S3Backend(StorageBackend):
     Example:
         >>> backend = S3Backend("my-bucket", prefix="training/run-001/")
         >>> backend.save(state, "step_1000.pt")
+
+        # Or with explicit config for timeout/retry:
+        >>> config = S3Config(bucket="my-bucket", connect_timeout=30.0, max_retries=5)
+        >>> backend = S3Backend.from_config(config)
     """
 
     def __init__(
@@ -290,6 +444,10 @@ class S3Backend(StorageBackend):
         bucket: str,
         prefix: str = "",
         region: str | None = None,
+        connect_timeout: float = 10.0,
+        read_timeout: float = 60.0,
+        max_retries: int = 3,
+        retry_mode: str = "adaptive",
     ):
         """Initialize S3 storage backend.
 
@@ -297,6 +455,10 @@ class S3Backend(StorageBackend):
             bucket: S3 bucket name.
             prefix: Key prefix for all checkpoints.
             region: AWS region (uses default if not specified).
+            connect_timeout: Connection timeout in seconds.
+            read_timeout: Read timeout in seconds.
+            max_retries: Maximum number of retry attempts.
+            retry_mode: Boto3 retry mode ('standard', 'adaptive', or 'legacy').
         """
         self.bucket = bucket
         self.prefix = prefix.rstrip("/") + "/" if prefix else ""
@@ -305,11 +467,42 @@ class S3Backend(StorageBackend):
         # Lazy import boto3
         try:
             import boto3
-            self._s3 = boto3.client("s3", region_name=region)
+            from botocore.config import Config as BotoConfig
         except ImportError:
             raise ImportError("boto3 is required for S3Backend. Install with: pip install boto3")
 
+        # Configure boto3 with timeout and retry settings
+        boto_config = BotoConfig(
+            connect_timeout=connect_timeout,
+            read_timeout=read_timeout,
+            retries={
+                "max_attempts": max_retries,
+                "mode": retry_mode,
+            },
+        )
+
+        self._s3 = boto3.client("s3", region_name=region, config=boto_config)
         self._executor = ThreadPoolExecutor(max_workers=2, thread_name_prefix="s3_ckpt")
+
+    @classmethod
+    def from_config(cls, config: S3Config) -> S3Backend:
+        """Create S3Backend from configuration object.
+
+        Args:
+            config: S3Config with all settings.
+
+        Returns:
+            Configured S3Backend instance.
+        """
+        return cls(
+            bucket=config.bucket,
+            prefix=config.prefix,
+            region=config.region,
+            connect_timeout=config.connect_timeout,
+            read_timeout=config.read_timeout,
+            max_retries=config.max_retries,
+            retry_mode=config.retry_mode,
+        )
 
     def _full_key(self, path: str) -> str:
         """Get full S3 key for a checkpoint."""
@@ -348,30 +541,53 @@ class S3Backend(StorageBackend):
         cpu_state = state.cpu_copy()
         return self._executor.submit(self.save, cpu_state, path)
 
-    def load(self, path: str) -> CheckpointState:
+    def load(
+        self,
+        path: str,
+        config: CheckpointLoadConfig | None = None,
+    ) -> CheckpointState:
         """Load checkpoint from S3.
 
         Args:
             path: Key suffix within the prefix.
+            config: Loading configuration. If None, uses safe defaults.
 
         Returns:
             The loaded CheckpointState.
 
+        Raises:
+            ValueError: If checkpoint validation fails.
+
         Note:
-            Security: This uses weights_only=False to support arbitrary Python
-            objects in checkpoints (optimizer state, RNG state, etc.). Only load
-            checkpoints from trusted sources, as malicious checkpoints could
-            execute arbitrary code during deserialization.
+            By default, this attempts safe loading (weights_only=True) first,
+            falling back to full loading if needed for optimizer state.
+            Set config.safe_mode=False to skip safe loading attempt.
         """
         from elastic_harness.checkpoint.checkpointing import CheckpointState
 
+        config = config or CheckpointLoadConfig()
         key = self._full_key(path)
 
         buffer = io.BytesIO()
         self._s3.download_fileobj(self.bucket, key, buffer)
         buffer.seek(0)
 
-        state_dict = torch.load(buffer, map_location="cpu", weights_only=False)
+        if config.safe_mode:
+            state_dict = _load_checkpoint_safe(buffer)
+        else:
+            if config.warn_on_unsafe:
+                logger.warning(
+                    f"Loading checkpoint '{path}' from S3 with safe_mode=False. "
+                    "Only load checkpoints from trusted sources."
+                )
+            state_dict = torch.load(buffer, map_location="cpu", weights_only=False)
+
+        # Validate checkpoint structure
+        if config.validate_structure:
+            is_valid, error_msg = _validate_checkpoint_structure(state_dict)
+            if not is_valid:
+                raise ValueError(f"Invalid checkpoint structure: {error_msg}")
+
         return CheckpointState.from_dict(state_dict)
 
     def exists(self, path: str) -> bool:

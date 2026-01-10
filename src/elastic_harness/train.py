@@ -349,9 +349,17 @@ def worker_main(args: argparse.Namespace) -> None:
             f"crash_after_step={chaos_config['crash_after_step']}"
         )
 
+    # Gradient clipping configuration
+    grad_clip_config = config.training.get("gradient_clipping", {})
+    grad_clip_enabled = grad_clip_config.get("enabled", True)
+    grad_clip_max_norm = grad_clip_config.get("max_norm", 1.0)
+    grad_clip_norm_type = grad_clip_config.get("norm_type", 2.0)
+    grad_clip_log = grad_clip_config.get("log_clipping", False)
+
     # Training loop
     model.train()
     accumulated_loss = 0.0
+    loss_count = 0  # Track actual number of losses accumulated for correct averaging
     micro_step = 0
     step_start_time = time.time()
 
@@ -392,12 +400,21 @@ def worker_main(args: argparse.Namespace) -> None:
 
         # Backward pass
         loss.backward()
-        accumulated_loss += loss.item()
+        # Track unscaled loss for accurate logging
+        accumulated_loss += outputs["loss"].item()
+        loss_count += 1
         micro_step += 1
 
         # Optimizer step (respects gradient accumulation)
         if scaling_manager.should_step():
-            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+            if grad_clip_enabled:
+                total_norm = torch.nn.utils.clip_grad_norm_(
+                    model.parameters(),
+                    max_norm=grad_clip_max_norm,
+                    norm_type=grad_clip_norm_type,
+                )
+                if grad_clip_log and total_norm > grad_clip_max_norm:
+                    logger.debug(f"Gradients clipped: {total_norm:.4f} -> {grad_clip_max_norm}")
             optimizer.step()
             optimizer.zero_grad()
 
@@ -410,13 +427,12 @@ def worker_main(args: argparse.Namespace) -> None:
         if step % log_interval == 0 and world_info.rank == 0:
             elapsed = time.time() - step_start_time
             tokens_per_sec = (
-                log_interval * local_batch_size *
+                loss_count * local_batch_size *
                 config.model.get("max_seq_length", 1024) * world_info.world_size
             ) / max(elapsed, 1e-6)
 
-            # Compute average loss over the logging interval
-            # accumulated_loss contains sum of (loss / accum_steps), so multiply back
-            avg_loss = (accumulated_loss * scaling_manager.accumulation_steps) / max(log_interval, 1)
+            # Compute average loss over the actual number of samples
+            avg_loss = accumulated_loss / max(loss_count, 1)
 
             logger.info(
                 f"Step {step} | Loss: {avg_loss:.4f} | "
@@ -426,6 +442,7 @@ def worker_main(args: argparse.Namespace) -> None:
             )
 
             accumulated_loss = 0.0
+            loss_count = 0
             step_start_time = time.time()
 
         # NVMe checkpoint (less frequent)
