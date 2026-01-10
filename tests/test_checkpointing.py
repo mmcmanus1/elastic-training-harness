@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import copy
 import tempfile
 import time
 from pathlib import Path
@@ -384,14 +385,36 @@ class TestCheckpointHelpers:
         # Should use module.state_dict()
         assert "linear.weight" in state.model_state_dict
 
-    def test_load_checkpoint_to_model(self, simple_model, simple_optimizer, checkpoint_state):
+    def test_load_checkpoint_to_model(self, simple_model, simple_optimizer):
         """Test loading checkpoint into model."""
-        # Modify model weights
+        # Set known non-zero weights before creating checkpoint
+        with torch.no_grad():
+            simple_model.linear.weight.fill_(1.0)
+            simple_model.linear.bias.fill_(0.5)
+
+        # Create checkpoint with known weights
+        # Note: deepcopy is needed because state_dict() returns references to tensors
+        checkpoint_state = CheckpointState(
+            step=100,
+            epoch=2,
+            model_state_dict=copy.deepcopy(simple_model.state_dict()),
+            optimizer_state_dict=copy.deepcopy(simple_optimizer.state_dict()),
+            lr_scheduler_state_dict={},
+            dataset_state={},
+            rng_states={},
+            metrics={},
+            world_size=1,
+            timestamp=time.time(),
+        )
+
+        # Zero the model weights
         with torch.no_grad():
             simple_model.linear.weight.fill_(0.0)
+            simple_model.linear.bias.fill_(0.0)
 
         # Load checkpoint
         load_checkpoint_to_model(checkpoint_state, simple_model, simple_optimizer)
 
-        # Weights should be restored
-        assert not torch.all(simple_model.linear.weight == 0)
+        # Weights should be restored to known values
+        assert torch.allclose(simple_model.linear.weight, torch.ones_like(simple_model.linear.weight))
+        assert torch.allclose(simple_model.linear.bias, torch.full_like(simple_model.linear.bias, 0.5))
