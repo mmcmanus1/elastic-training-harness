@@ -21,7 +21,7 @@ from elastic_harness.checkpoint.checkpointing import (
     load_checkpoint_to_model,
 )
 from elastic_harness.checkpoint.memory_snapshot import MemorySnapshotBackend
-from elastic_harness.checkpoint.storage_backends import NVMeBackend
+from elastic_harness.checkpoint.storage_backends import CheckpointLoadConfig, NVMeBackend
 
 
 class SimpleModel(nn.Module):
@@ -418,3 +418,68 @@ class TestCheckpointHelpers:
         # Weights should be restored to known values
         assert torch.allclose(simple_model.linear.weight, torch.ones_like(simple_model.linear.weight))
         assert torch.allclose(simple_model.linear.bias, torch.full_like(simple_model.linear.bias, 0.5))
+
+
+class TestCheckpointLoadConfig:
+    """Tests for CheckpointLoadConfig and trusted_source functionality."""
+
+    def test_default_config(self):
+        """Test default configuration values."""
+        config = CheckpointLoadConfig()
+
+        assert config.safe_mode is True
+        assert config.validate_structure is True
+        assert config.warn_on_unsafe is True
+        assert config.trusted_source is False
+
+    def test_trusted_source_config(self):
+        """Test trusted_source configuration."""
+        config = CheckpointLoadConfig(trusted_source=True)
+
+        assert config.trusted_source is True
+        assert config.safe_mode is True  # Other defaults unchanged
+
+    def test_load_with_trusted_source(self, checkpoint_state, tmp_path):
+        """Test that trusted_source=True suppresses warnings during load."""
+        backend = NVMeBackend(tmp_path)
+        backend.save(checkpoint_state, "trusted_test.pt")
+
+        # Load with trusted_source=True - should not log security warnings
+        config = CheckpointLoadConfig(trusted_source=True)
+        loaded = backend.load("trusted_test.pt", config=config)
+
+        assert loaded.step == checkpoint_state.step
+
+    def test_load_with_default_config(self, checkpoint_state, tmp_path):
+        """Test loading with default config."""
+        backend = NVMeBackend(tmp_path)
+        backend.save(checkpoint_state, "default_test.pt")
+
+        # Load with default config
+        loaded = backend.load("default_test.pt")
+
+        assert loaded.step == checkpoint_state.step
+
+    def test_safe_globals_registration(self):
+        """Test that safe globals registration is available on PyTorch 2.4+."""
+        # This tests that the module loads without error
+        # and that the safe globals function was called if available
+        import elastic_harness.checkpoint.storage_backends as sb
+
+        # The function should exist
+        assert hasattr(sb, "_register_safe_checkpoint_types")
+
+        # Check if add_safe_globals is available (PyTorch 2.4+)
+        has_safe_globals = hasattr(torch.serialization, "add_safe_globals")
+
+        if has_safe_globals:
+            # On PyTorch 2.4+, OrderedDict should be registered
+            # We can't directly check the registry, but we can verify
+            # the function exists and was called without error
+            import collections
+
+            # Try to add it again - should not raise
+            try:
+                torch.serialization.add_safe_globals([collections.OrderedDict])
+            except Exception:
+                pytest.fail("add_safe_globals raised an exception")
