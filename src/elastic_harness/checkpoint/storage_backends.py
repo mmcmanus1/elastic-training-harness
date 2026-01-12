@@ -26,6 +26,29 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
+def _register_safe_checkpoint_types() -> None:
+    """Register commonly needed types for checkpoint loading with weights_only=True.
+
+    PyTorch 2.4+ provides add_safe_globals() to whitelist types for the
+    restricted unpickler. This reduces fallback to weights_only=False.
+    """
+    if not hasattr(torch.serialization, "add_safe_globals"):
+        # PyTorch < 2.4 doesn't have this API
+        return
+
+    import collections
+
+    try:
+        torch.serialization.add_safe_globals([collections.OrderedDict])
+    except Exception:
+        # Non-fatal - checkpoint loading will still work via fallback
+        pass
+
+
+# Register at module load time
+_register_safe_checkpoint_types()
+
+
 @dataclass
 class CheckpointLoadConfig:
     """Configuration for checkpoint loading behavior.
@@ -37,11 +60,14 @@ class CheckpointLoadConfig:
             checkpoints, consider additional validation.
         validate_structure: If True, validate required keys exist.
         warn_on_unsafe: Log a warning when loading without safe_mode.
+        trusted_source: If True, suppress security warnings when falling back
+            to weights_only=False. Use for checkpoints from known-trusted sources.
     """
 
     safe_mode: bool = True
     validate_structure: bool = True
     warn_on_unsafe: bool = True
+    trusted_source: bool = False
 
 
 def _validate_checkpoint_structure(state_dict: dict[str, Any]) -> tuple[bool, str]:
@@ -83,7 +109,10 @@ def _validate_checkpoint_structure(state_dict: dict[str, Any]) -> tuple[bool, st
     return True, ""
 
 
-def _load_checkpoint_safe(path_or_buffer: str | Path | io.BytesIO) -> dict[str, Any]:
+def _load_checkpoint_safe(
+    path_or_buffer: str | Path | io.BytesIO,
+    config: CheckpointLoadConfig | None = None,
+) -> dict[str, Any]:
     """Load checkpoint with safety measures.
 
     Attempts to load with weights_only=True first, then falls back to
@@ -91,37 +120,48 @@ def _load_checkpoint_safe(path_or_buffer: str | Path | io.BytesIO) -> dict[str, 
 
     Args:
         path_or_buffer: File path or BytesIO buffer containing checkpoint.
+        config: Loading configuration. If None, uses default config.
 
     Returns:
         Loaded checkpoint dictionary.
 
     Note:
         This function attempts safe loading but may fall back to unsafe
-        loading for full optimizer state support. The fallback logs a warning.
+        loading for full optimizer state support. The fallback logs a warning
+        unless trusted_source=True in config.
     """
+    config = config or CheckpointLoadConfig()
+
     try:
         # Try safe loading first (weights_only=True)
         state_dict = torch.load(path_or_buffer, map_location="cpu", weights_only=True)
         return state_dict
     except Exception as e:
         # weights_only=True may fail for optimizer states with complex objects
-        # Log at WARNING level so users are aware of the fallback
-        logger.warning(
-            f"Safe checkpoint loading failed (weights_only=True): {e}. "
-            "Falling back to full deserialization."
-        )
+        # Log level depends on trusted_source setting
+        if config.trusted_source:
+            logger.debug(
+                f"Safe checkpoint loading failed (weights_only=True): {e}. "
+                "Falling back to full deserialization (trusted_source=True)."
+            )
+        else:
+            logger.warning(
+                f"Safe checkpoint loading failed (weights_only=True): {e}. "
+                "Falling back to full deserialization."
+            )
 
         # Reset buffer position if BytesIO
         if isinstance(path_or_buffer, io.BytesIO):
             path_or_buffer.seek(0)
 
-        # Fall back to full load - log prominent warning about security implications
-        logger.warning(
-            "SECURITY: Loading checkpoint with weights_only=False enables arbitrary "
-            "code execution during deserialization. Only load checkpoints from "
-            "trusted sources. Consider using CheckpointLoadConfig(safe_mode=False) "
-            "explicitly if this is intentional."
-        )
+        # Fall back to full load - log security warning unless trusted_source
+        if not config.trusted_source:
+            logger.warning(
+                "SECURITY: Loading checkpoint with weights_only=False enables arbitrary "
+                "code execution during deserialization. Only load checkpoints from "
+                "trusted sources. Consider using CheckpointLoadConfig(trusted_source=True) "
+                "to suppress this warning for known-trusted checkpoints."
+            )
         state_dict = torch.load(path_or_buffer, map_location="cpu", weights_only=False)
         return state_dict
 
@@ -303,7 +343,7 @@ class NVMeBackend(StorageBackend):
         full_path = self._full_path(path)
 
         if config.safe_mode:
-            state_dict = _load_checkpoint_safe(full_path)
+            state_dict = _load_checkpoint_safe(full_path, config)
         else:
             if config.warn_on_unsafe:
                 logger.warning(
@@ -573,7 +613,7 @@ class S3Backend(StorageBackend):
         buffer.seek(0)
 
         if config.safe_mode:
-            state_dict = _load_checkpoint_safe(buffer)
+            state_dict = _load_checkpoint_safe(buffer, config)
         else:
             if config.warn_on_unsafe:
                 logger.warning(
