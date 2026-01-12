@@ -203,6 +203,12 @@ pytest --cov=elastic_harness
 pytest -m "not integration"
 ```
 
+## Documentation
+
+- **[Troubleshooting Guide](docs/TROUBLESHOOTING.md)** — Common issues and solutions for distributed training, etcd, checkpoints, and more.
+- **[API Reference](docs/API_REFERENCE.md)** — Complete reference for all public modules, classes, and functions.
+- **[Design Document](DESIGN.md)** — Architecture decisions, trade-offs, and implementation details.
+
 ## Success Metrics
 
 The harness is designed to meet these targets:
