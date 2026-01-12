@@ -4,6 +4,7 @@
 |----------|-------------|
 | [![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/mmcmanus1/elastic-training-harness/blob/main/notebooks/elastic_training_colab.ipynb) | **Basic Demo** — ~1M param model, synthetic data, 100 steps. Quick intro to checkpointing, LR scaling, and fault tolerance. |
 | [![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/mmcmanus1/elastic-training-harness/blob/main/notebooks/elastic_training_large.ipynb) | **Large-Scale Practice** — ~100M param model, WikiText-2 dataset, 500 steps. Full training run with validation tracking and text generation. |
+| [![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/mmcmanus1/elastic-training-harness/blob/main/notebooks/elastic_training_gpt2_finetune.ipynb) | **GPT-2 Fine-Tuning** — 124M param pretrained GPT-2, WikiText-2 dataset, 1000 steps. Full pipeline producing coherent text output. |
 
 # Elastic Training Harness
 
